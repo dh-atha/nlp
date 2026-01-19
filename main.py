@@ -1,9 +1,15 @@
 from flask import Flask, render_template_string, request, redirect, url_for
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server
+import matplotlib.pyplot as plt
 import matplotlib.text as mpl_text
+import seaborn as sns
 import pandas as pd
 import numpy as np
 import re
 import os
+import io
+import base64
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
@@ -13,6 +19,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import cross_val_score, train_test_split, cross_val_predict
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 
 from collections import Counter
 import pickle
@@ -330,6 +339,327 @@ def classify_spam_svm(text: str):
     return (label, round(float(max(proba)), 2))
 # ===================== END SVM CLASSIFIERS =====================
 
+# ===================== ALL MODELS (3 Algorithms × 2 Feature Extractors) =====================
+
+def train_all_models():
+    """
+    Train all combinations of:
+    - Algorithms: Naive Bayes, Decision Tree, SVM
+    - Feature Extraction: BoW (CountVectorizer), TF-IDF (TfidfVectorizer)
+    
+    Returns dict of trained models with cross-validation scores and evaluation metrics.
+    """
+    sentiment_texts, sentiment_labels, spam_texts, spam_labels = create_training_data()
+    
+    models = {}
+    
+    # Define classifiers
+    classifiers = {
+        'Naive Bayes': lambda: MultinomialNB(alpha=0.1),
+        'Decision Tree': lambda: DecisionTreeClassifier(max_depth=10, random_state=42),
+        'SVM': lambda: LinearSVC(random_state=42, max_iter=2000)
+    }
+    
+    # Train for both tasks: sentiment and spam
+    for task_name, (texts, labels) in [('sentiment', (sentiment_texts, sentiment_labels)), 
+                                        ('spam', (spam_texts, spam_labels))]:
+        
+        # Get unique labels for this task
+        unique_labels = list(set(labels))
+        
+        for vec_name in ['BoW', 'TF-IDF']:
+            for clf_name, clf_factory in classifiers.items():
+                model_key = f"{task_name}_{clf_name}_{vec_name}"
+                
+                # Create fresh vectorizer and classifier instances
+                vec = CountVectorizer(ngram_range=(1, 2), max_features=5000) if vec_name == 'BoW' else TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
+                clf = clf_factory()
+                
+                # Create pipeline
+                pipeline = Pipeline([
+                    ('vectorizer', vec),
+                    ('classifier', clf)
+                ])
+                
+                # Fit the model
+                pipeline.fit(texts, labels)
+                
+                # Cross-validation predictions for evaluation metrics
+                try:
+                    cv_predictions = cross_val_predict(pipeline, texts, labels, cv=3)
+                    
+                    # Calculate metrics
+                    accuracy = accuracy_score(labels, cv_predictions)
+                    precision = precision_score(labels, cv_predictions, average='weighted', zero_division=0)
+                    recall = recall_score(labels, cv_predictions, average='weighted', zero_division=0)
+                    f1 = f1_score(labels, cv_predictions, average='weighted', zero_division=0)
+                    conf_matrix = confusion_matrix(labels, cv_predictions, labels=unique_labels)
+                    
+                    # Cross-validation score
+                    cv_scores = cross_val_score(pipeline, texts, labels, cv=3, scoring='accuracy')
+                    cv_mean = cv_scores.mean()
+                    cv_std = cv_scores.std()
+                except Exception as e:
+                    print(f"  Warning: {model_key} - {e}")
+                    accuracy = precision = recall = f1 = cv_mean = cv_std = 0.0
+                    conf_matrix = np.zeros((len(unique_labels), len(unique_labels)))
+                
+                # For SVM, wrap with CalibratedClassifierCV to get probabilities
+                if clf_name == 'SVM':
+                    # Refit for calibration
+                    vec2 = CountVectorizer(ngram_range=(1, 2), max_features=5000) if vec_name == 'BoW' else TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
+                    clf2 = LinearSVC(random_state=42, max_iter=2000)
+                    pipeline2 = Pipeline([('vectorizer', vec2), ('classifier', clf2)])
+                    pipeline2.fit(texts, labels)
+                    
+                    calibrated = CalibratedClassifierCV(estimator=pipeline2, cv='prefit')
+                    calibrated.fit(texts, labels)
+                    final_model = calibrated
+                else:
+                    final_model = pipeline
+                
+                models[model_key] = {
+                    'model': final_model,
+                    'task': task_name,
+                    'algorithm': clf_name,
+                    'feature_extraction': vec_name,
+                    'cv_accuracy': round(cv_mean * 100, 2),
+                    'cv_std': round(cv_std * 100, 2),
+                    'accuracy': round(accuracy * 100, 2),
+                    'precision': round(precision * 100, 2),
+                    'recall': round(recall * 100, 2),
+                    'f1_score': round(f1 * 100, 2),
+                    'confusion_matrix': conf_matrix.tolist(),
+                    'labels': unique_labels,
+                    'training_samples': len(texts)
+                }
+                
+                print(f"  Trained: {model_key} (Acc: {accuracy*100:.1f}%, P: {precision*100:.1f}%, R: {recall*100:.1f}%, F1: {f1*100:.1f}%)")
+    
+    return models
+
+print("\nTraining ALL model combinations (3 algorithms × 2 feature extractors × 2 tasks)...")
+ALL_MODELS = train_all_models()
+print(f"All {len(ALL_MODELS)} models ready!\n")
+
+def generate_confusion_matrix_heatmap(conf_matrix, labels, title):
+    """Generate confusion matrix heatmap as base64 image."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=labels, yticklabels=labels, ax=ax)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title(title)
+    plt.tight_layout()
+    
+    # Convert to base64
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return img_base64
+
+def generate_accuracy_comparison_chart(task='sentiment'):
+    """Generate accuracy comparison bar chart for all models of a task."""
+    models_data = [(k, v) for k, v in ALL_MODELS.items() if v['task'] == task]
+    
+    algorithms = ['Naive Bayes', 'Decision Tree', 'SVM']
+    bow_scores = []
+    tfidf_scores = []
+    
+    for algo in algorithms:
+        for key, info in models_data:
+            if info['algorithm'] == algo:
+                if info['feature_extraction'] == 'BoW':
+                    bow_scores.append(info['accuracy'])
+                else:
+                    tfidf_scores.append(info['accuracy'])
+    
+    x = np.arange(len(algorithms))
+    width = 0.35
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars1 = ax.bar(x - width/2, bow_scores, width, label='BoW', color='#17a2b8')
+    bars2 = ax.bar(x + width/2, tfidf_scores, width, label='TF-IDF', color='#ffc107')
+    
+    ax.set_xlabel('Algorithm')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(f'{task.title()} Classification - Accuracy Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(algorithms)
+    ax.legend()
+    ax.set_ylim(0, 105)
+    
+    # Add value labels on bars
+    for bar in bars1:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}%', xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    for bar in bars2:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}%', xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return img_base64
+
+def generate_bow_vs_tfidf_chart():
+    """Generate comparison chart between BoW and TF-IDF across all models."""
+    metrics = ['accuracy', 'precision', 'recall', 'f1_score']
+    metric_labels = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
+    
+    # Calculate averages for BoW and TF-IDF
+    bow_avgs = []
+    tfidf_avgs = []
+    
+    for metric in metrics:
+        bow_values = [v[metric] for v in ALL_MODELS.values() if v['feature_extraction'] == 'BoW']
+        tfidf_values = [v[metric] for v in ALL_MODELS.values() if v['feature_extraction'] == 'TF-IDF']
+        bow_avgs.append(np.mean(bow_values))
+        tfidf_avgs.append(np.mean(tfidf_values))
+    
+    x = np.arange(len(metrics))
+    width = 0.35
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars1 = ax.bar(x - width/2, bow_avgs, width, label='BoW (Bag of Words)', color='#17a2b8')
+    bars2 = ax.bar(x + width/2, tfidf_avgs, width, label='TF-IDF', color='#ffc107')
+    
+    ax.set_xlabel('Metric')
+    ax.set_ylabel('Score (%)')
+    ax.set_title('BoW vs TF-IDF - Average Performance Across All Models')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels)
+    ax.legend()
+    ax.set_ylim(0, 105)
+    
+    for bar in bars1:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}%', xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    for bar in bars2:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}%', xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return img_base64
+
+def generate_all_metrics_chart(task='sentiment'):
+    """Generate grouped bar chart comparing all metrics for each model."""
+    models_data = [(k, v) for k, v in ALL_MODELS.items() if v['task'] == task]
+    
+    model_names = []
+    accuracies = []
+    precisions = []
+    recalls = []
+    f1_scores = []
+    
+    for key, info in sorted(models_data, key=lambda x: (x[1]['algorithm'], x[1]['feature_extraction'])):
+        model_names.append(f"{info['algorithm']}\n({info['feature_extraction']})")
+        accuracies.append(info['accuracy'])
+        precisions.append(info['precision'])
+        recalls.append(info['recall'])
+        f1_scores.append(info['f1_score'])
+    
+    x = np.arange(len(model_names))
+    width = 0.2
+    
+    fig, ax = plt.subplots(figsize=(14, 6))
+    bars1 = ax.bar(x - 1.5*width, accuracies, width, label='Accuracy', color='#28a745')
+    bars2 = ax.bar(x - 0.5*width, precisions, width, label='Precision', color='#17a2b8')
+    bars3 = ax.bar(x + 0.5*width, recalls, width, label='Recall', color='#ffc107')
+    bars4 = ax.bar(x + 1.5*width, f1_scores, width, label='F1-Score', color='#dc3545')
+    
+    ax.set_xlabel('Model')
+    ax.set_ylabel('Score (%)')
+    ax.set_title(f'{task.title()} Classification - All Metrics Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, fontsize=8)
+    ax.legend(loc='upper right')
+    ax.set_ylim(0, 110)
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return img_base64
+
+def classify_with_model(text: str, task: str, algorithm: str, feature_extraction: str) -> tuple:
+    """
+    Classify text using a specific model combination.
+    Returns (label, confidence).
+    """
+    if not text or not text.strip():
+        default_label = 'neutral' if task == 'sentiment' else 'not_spam'
+        return (default_label, 0.0)
+    
+    text_clean = clean_text(text)
+    if not text_clean:
+        default_label = 'neutral' if task == 'sentiment' else 'not_spam'
+        return (default_label, 0.0)
+    
+    model_key = f"{task}_{algorithm}_{feature_extraction}"
+    
+    if model_key not in ALL_MODELS:
+        return ('unknown', 0.0)
+    
+    model_info = ALL_MODELS[model_key]
+    model = model_info['model']
+    
+    # Predict
+    label = model.predict([text_clean])[0]
+    
+    # Get probability if available
+    if hasattr(model, 'predict_proba'):
+        proba = model.predict_proba([text_clean])[0]
+        confidence = float(max(proba))
+    else:
+        confidence = 1.0  # No probability available
+    
+    return (label, round(confidence, 2))
+
+def get_model_comparison():
+    """Get comparison data for all models."""
+    comparison = []
+    for key, info in ALL_MODELS.items():
+        comparison.append({
+            'model_key': key,
+            'task': info['task'].title(),
+            'algorithm': info['algorithm'],
+            'feature_extraction': info['feature_extraction'],
+            'cv_accuracy': info['cv_accuracy'],
+            'cv_std': info['cv_std'],
+            'accuracy': info['accuracy'],
+            'precision': info['precision'],
+            'recall': info['recall'],
+            'f1_score': info['f1_score'],
+            'training_samples': info['training_samples']
+        })
+    return comparison
+
+# ===================== END ALL MODELS =====================
+
 EMOJI_PATTERN = re.compile("["
 													 "\U0001F600-\U0001F64F"  # emoticons
 													 "\U0001F300-\U0001F5FF"  # symbols & pictographs
@@ -428,6 +758,9 @@ INDEX_HTML = '''
 				<form method="get" action="/show_all" class="d-inline">
 					<button class="btn btn-outline-secondary">Show All Data</button>
 				</form>
+				<a href="/features" class="btn btn-outline-info ms-2">Feature Extraction (BoW/TF-IDF)</a>
+				<a href="/models" class="btn btn-outline-success ms-2">Model Comparison (All 12 Models)</a>
+				<a href="/models/evaluation" class="btn btn-outline-warning ms-2">Model Evaluation & Metrics</a>
 			</div>
 
 			{% if table_html %}
@@ -564,14 +897,6 @@ RESULT_HTML = '''
 			<div class="table-responsive">{{ result_table | safe }}</div>
 
 			<hr>
-			<h6>Notes</h6>
-			<ul>
-				<li>Cleaning steps: remove URLs, emojis, mentions, punctuation, digits.</li>
-				<li>Tokenization: NLTK word_tokenize (fallback to split on failure).</li>
-				<li>Stopwords: NLTK Indonesian stopwords if available, otherwise fallback list.</li>
-				<li><strong>Sentiment:</strong> Naive Bayes classifier with Indonesian lexicon (positive/negative/neutral).</li>
-				<li><strong>Spam Detection:</strong> Naive Bayes classifier trained on common spam patterns.</li>
-			</ul>
 		</div>
 	</body>
 </html>
@@ -683,6 +1008,656 @@ SVM_HTML = '''
 </html>
 '''
 
+FEATURES_HTML = '''
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feature Extraction - {{ method }}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .feature-matrix { font-size: 0.85rem; }
+    .feature-matrix th { position: sticky; top: 0; background: #f8f9fa; }
+    .vocab-list { max-height: 300px; overflow-y: auto; }
+    .highlight { background-color: #fff3cd; }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container-fluid py-4">
+
+<h2>Feature Extraction Output</h2>
+<p class="text-muted">Raw vectorized representation (not trained yet)</p>
+
+<a href="/" class="btn btn-secondary mb-3">&larr; Back</a>
+
+<div class="row mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">
+        <strong>Select Method & Data</strong>
+      </div>
+      <div class="card-body">
+        <form method="get" action="/features" class="row g-3">
+          <div class="col-md-3">
+            <label class="form-label">CSV Path</label>
+            <input name="csv_path" class="form-control" value="{{ csv_path }}">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Text Column</label>
+            <input name="text_col" class="form-control" value="{{ text_col }}">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Method</label>
+            <select name="method" class="form-select">
+              <option value="bow" {% if method == 'bow' %}selected{% endif %}>Bag of Words (BoW)</option>
+              <option value="tfidf" {% if method == 'tfidf' %}selected{% endif %}>TF-IDF</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Max Features</label>
+            <input name="max_features" type="number" min="10" max="1000" class="form-control" value="{{ max_features }}">
+          </div>
+          <div class="col-md-1">
+            <label class="form-label">N-gram</label>
+            <select name="ngram" class="form-select">
+              <option value="1" {% if ngram == 1 %}selected{% endif %}>1</option>
+              <option value="2" {% if ngram == 2 %}selected{% endif %}>1-2</option>
+              <option value="3" {% if ngram == 3 %}selected{% endif %}>1-3</option>
+            </select>
+          </div>
+          <div class="col-md-2 align-self-end">
+            <button class="btn btn-primary w-100">Extract Features</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if error %}
+  <div class="alert alert-danger">{{ error }}</div>
+{% endif %}
+
+{% if vocab %}
+<div class="row mb-4">
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-header"><strong>Vocabulary ({{ vocab|length }} features)</strong></div>
+      <div class="card-body vocab-list">
+        <table class="table table-sm">
+          <thead><tr><th>Index</th><th>Term</th></tr></thead>
+          <tbody>
+          {% for idx, term in vocab %}
+            <tr><td>{{ idx }}</td><td><code>{{ term }}</code></td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-8">
+    <div class="card">
+      <div class="card-header">
+        <strong>{{ method_name }} Matrix</strong>
+        <span class="text-muted">({{ matrix_shape.0 }} documents × {{ matrix_shape.1 }} features)</span>
+      </div>
+      <div class="card-body">
+        <p class="small text-muted mb-2">
+          {% if method == 'bow' %}
+            Values = word counts per document
+          {% else %}
+            Values = TF-IDF weights (higher = more important in that document)
+          {% endif %}
+        </p>
+        <div class="table-responsive" style="max-height: 500px; overflow: auto;">
+          {{ matrix_html | safe }}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><strong>Sample Documents (first {{ sample_docs|length }})</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped">
+          <thead><tr><th>Doc #</th><th>Original Text</th><th>Cleaned Text</th></tr></thead>
+          <tbody>
+          {% for doc in sample_docs %}
+            <tr>
+              <td>{{ doc.idx }}</td>
+              <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{{ doc.original[:100] }}{% if doc.original|length > 100 %}...{% endif %}</td>
+              <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{{ doc.cleaned[:100] }}{% if doc.cleaned|length > 100 %}...{% endif %}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+</div>
+</body>
+</html>
+'''
+
+MODELS_HTML = '''
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Comparison</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .badge-positive { background:#198754 }
+    .badge-negative { background:#dc3545 }
+    .badge-neutral { background:#6c757d }
+    .badge-spam { background:#fd7e14 }
+    .badge-not_spam { background:#20c997 }
+    .best-score { background-color: #d4edda !important; font-weight: bold; }
+    .model-card { transition: transform 0.2s; }
+    .model-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container-fluid py-4">
+
+<h2>Model Comparison</h2>
+<p class="text-muted">All trained models: 3 Algorithms × 2 Feature Extractors × 2 Tasks = 12 Models</p>
+
+<a href="/" class="btn btn-secondary mb-3">&larr; Back</a>
+<a href="/models/test" class="btn btn-primary mb-3 ms-2">Test Models with Custom Text</a>
+<a href="/models/evaluation" class="btn btn-success mb-3 ms-2">Model Evaluation & Metrics</a>
+
+<!-- Model Comparison Tables -->
+<div class="row mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><strong>Sentiment Classification Models</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped table-hover">
+          <thead class="table-dark">
+            <tr>
+              <th>Algorithm</th>
+              <th>Feature Extraction</th>
+              <th>CV Accuracy (%)</th>
+              <th>Std Dev</th>
+              <th>Training Samples</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for model in sentiment_models %}
+            <tr class="{% if model.is_best %}best-score{% endif %}">
+              <td><strong>{{ model.algorithm }}</strong></td>
+              <td><span class="badge {% if model.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ model.feature_extraction }}</span></td>
+              <td>{{ model.cv_accuracy }}%</td>
+              <td>±{{ model.cv_std }}%</td>
+              <td>{{ model.training_samples }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><strong>Spam Detection Models</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped table-hover">
+          <thead class="table-dark">
+            <tr>
+              <th>Algorithm</th>
+              <th>Feature Extraction</th>
+              <th>CV Accuracy (%)</th>
+              <th>Std Dev</th>
+              <th>Training Samples</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for model in spam_models %}
+            <tr class="{% if model.is_best %}best-score{% endif %}">
+              <td><strong>{{ model.algorithm }}</strong></td>
+              <td><span class="badge {% if model.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ model.feature_extraction }}</span></td>
+              <td>{{ model.cv_accuracy }}%</td>
+              <td>±{{ model.cv_std }}%</td>
+              <td>{{ model.training_samples }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Summary Cards -->
+<div class="row mb-4">
+  <div class="col-md-6">
+    <div class="card model-card border-success">
+      <div class="card-header bg-success text-white"><strong>Best Sentiment Model</strong></div>
+      <div class="card-body">
+        <h5>{{ best_sentiment.algorithm }} + {{ best_sentiment.feature_extraction }}</h5>
+        <p class="mb-0">Accuracy: <strong>{{ best_sentiment.cv_accuracy }}%</strong> (±{{ best_sentiment.cv_std }}%)</p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card model-card border-warning">
+      <div class="card-header bg-warning"><strong>Best Spam Model</strong></div>
+      <div class="card-body">
+        <h5>{{ best_spam.algorithm }} + {{ best_spam.feature_extraction }}</h5>
+        <p class="mb-0">Accuracy: <strong>{{ best_spam.cv_accuracy }}%</strong> (±{{ best_spam.cv_std }}%)</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Algorithm Explanation -->
+<div class="row">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><strong>Model Details</strong></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-4">
+            <h6>Algorithms</h6>
+            <ul class="small">
+              <li><strong>Naive Bayes</strong>: Probabilistic classifier, fast, works well with text</li>
+              <li><strong>Decision Tree</strong>: Rule-based, interpretable, max_depth=10</li>
+              <li><strong>SVM</strong>: Linear SVC, good for high-dimensional text data</li>
+            </ul>
+          </div>
+          <div class="col-md-4">
+            <h6>Feature Extraction</h6>
+            <ul class="small">
+              <li><strong>BoW (Bag of Words)</strong>: Raw word counts using CountVectorizer</li>
+              <li><strong>TF-IDF</strong>: Term frequency-inverse document frequency weights</li>
+            </ul>
+          </div>
+          <div class="col-md-4">
+            <h6>Evaluation</h6>
+            <ul class="small">
+              <li><strong>CV Accuracy</strong>: 3-fold cross-validation mean</li>
+              <li><strong>Std Dev</strong>: Variation across folds</li>
+              <li>Green row = best model for that task</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+</body>
+</html>
+'''
+
+MODELS_TEST_HTML = '''
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Test Models</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .badge-positive { background:#198754 }
+    .badge-negative { background:#dc3545 }
+    .badge-neutral { background:#6c757d }
+    .badge-spam { background:#fd7e14 }
+    .badge-not_spam { background:#20c997 }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container py-4">
+
+<h2>Test All Models</h2>
+<p class="text-muted">Compare predictions from all 12 model combinations</p>
+
+<a href="/models" class="btn btn-secondary mb-3">&larr; Back to Comparison</a>
+
+<div class="card mb-4">
+  <div class="card-header"><strong>Enter Text to Classify</strong></div>
+  <div class="card-body">
+    <form method="post" action="/models/test">
+      <div class="mb-3">
+        <textarea name="text" class="form-control" rows="3" placeholder="Enter Indonesian text to classify...">{{ test_text or '' }}</textarea>
+      </div>
+      <button class="btn btn-primary">Classify with All Models</button>
+    </form>
+  </div>
+</div>
+
+{% if results %}
+<div class="row">
+  <div class="col-md-6">
+    <div class="card mb-4">
+      <div class="card-header bg-primary text-white"><strong>Sentiment Classification Results</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped">
+          <thead>
+            <tr><th>Algorithm</th><th>Features</th><th>Prediction</th><th>Confidence</th></tr>
+          </thead>
+          <tbody>
+          {% for r in results.sentiment %}
+            <tr>
+              <td>{{ r.algorithm }}</td>
+              <td><span class="badge {% if r.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ r.feature_extraction }}</span></td>
+              <td><span class="badge badge-{{ r.label }}">{{ r.label }}</span></td>
+              <td>{{ (r.confidence * 100)|round(1) }}%</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card mb-4">
+      <div class="card-header bg-warning"><strong>Spam Detection Results</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped">
+          <thead>
+            <tr><th>Algorithm</th><th>Features</th><th>Prediction</th><th>Confidence</th></tr>
+          </thead>
+          <tbody>
+          {% for r in results.spam %}
+            <tr>
+              <td>{{ r.algorithm }}</td>
+              <td><span class="badge {% if r.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ r.feature_extraction }}</span></td>
+              <td><span class="badge badge-{{ r.label }}">{{ r.label }}</span></td>
+              <td>{{ (r.confidence * 100)|round(1) }}%</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><strong>Cleaned Text</strong></div>
+  <div class="card-body">
+    <code>{{ cleaned_text }}</code>
+  </div>
+</div>
+{% endif %}
+
+</div>
+</body>
+</html>
+'''
+
+EVALUATION_HTML = '''
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Evaluation</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .metric-card { text-align: center; }
+    .metric-value { font-size: 2rem; font-weight: bold; }
+    .best-model { border: 3px solid #28a745 !important; }
+    .chart-container { background: white; padding: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container-fluid py-4">
+
+<h2>Model Evaluation & Metrics</h2>
+<p class="text-muted">Comprehensive evaluation with Accuracy, Precision, Recall, F1-Score, and Confusion Matrix</p>
+
+<a href="/models" class="btn btn-secondary mb-3">&larr; Back to Models</a>
+
+<!-- Task Selection -->
+<ul class="nav nav-tabs mb-4" id="taskTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="sentiment-tab" data-bs-toggle="tab" data-bs-target="#sentiment" type="button" role="tab">Sentiment Classification</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="spam-tab" data-bs-toggle="tab" data-bs-target="#spam" type="button" role="tab">Spam Detection</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="comparison-tab" data-bs-toggle="tab" data-bs-target="#comparison" type="button" role="tab">BoW vs TF-IDF</button>
+  </li>
+</ul>
+
+<div class="tab-content" id="taskTabsContent">
+  <!-- Sentiment Tab -->
+  <div class="tab-pane fade show active" id="sentiment" role="tabpanel">
+    <h4>Sentiment Classification Models</h4>
+    
+    <!-- Metrics Table -->
+    <div class="card mb-4">
+      <div class="card-header"><strong>Evaluation Metrics</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped table-hover">
+          <thead class="table-dark">
+            <tr>
+              <th>Algorithm</th>
+              <th>Features</th>
+              <th>Accuracy</th>
+              <th>Precision</th>
+              <th>Recall</th>
+              <th>F1-Score</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for m in sentiment_models %}
+            <tr class="{% if m.is_best %}table-success{% endif %}">
+              <td><strong>{{ m.algorithm }}</strong></td>
+              <td><span class="badge {% if m.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ m.feature_extraction }}</span></td>
+              <td>{{ m.accuracy }}%</td>
+              <td>{{ m.precision }}%</td>
+              <td>{{ m.recall }}%</td>
+              <td>{{ m.f1_score }}%</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    
+    <!-- Charts Row -->
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>Accuracy Comparison</strong></div>
+          <div class="card-body chart-container text-center">
+            <img src="data:image/png;base64,{{ sentiment_accuracy_chart }}" class="img-fluid" alt="Sentiment Accuracy Comparison">
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>All Metrics Comparison</strong></div>
+          <div class="card-body chart-container text-center">
+            <img src="data:image/png;base64,{{ sentiment_metrics_chart }}" class="img-fluid" alt="Sentiment All Metrics">
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Confusion Matrices -->
+    <h5 class="mt-4">Confusion Matrices</h5>
+    <div class="row">
+      {% for m in sentiment_models %}
+      <div class="col-md-4 mb-3">
+        <div class="card {% if m.is_best %}best-model{% endif %}">
+          <div class="card-header">
+            <strong>{{ m.algorithm }}</strong> ({{ m.feature_extraction }})
+            {% if m.is_best %}<span class="badge bg-success ms-2">Best</span>{% endif %}
+          </div>
+          <div class="card-body text-center">
+            <img src="data:image/png;base64,{{ m.cm_image }}" class="img-fluid" alt="Confusion Matrix">
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  
+  <!-- Spam Tab -->
+  <div class="tab-pane fade" id="spam" role="tabpanel">
+    <h4>Spam Detection Models</h4>
+    
+    <!-- Metrics Table -->
+    <div class="card mb-4">
+      <div class="card-header"><strong>Evaluation Metrics</strong></div>
+      <div class="card-body">
+        <table class="table table-sm table-striped table-hover">
+          <thead class="table-dark">
+            <tr>
+              <th>Algorithm</th>
+              <th>Features</th>
+              <th>Accuracy</th>
+              <th>Precision</th>
+              <th>Recall</th>
+              <th>F1-Score</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for m in spam_models %}
+            <tr class="{% if m.is_best %}table-success{% endif %}">
+              <td><strong>{{ m.algorithm }}</strong></td>
+              <td><span class="badge {% if m.feature_extraction == 'BoW' %}bg-info{% else %}bg-warning text-dark{% endif %}">{{ m.feature_extraction }}</span></td>
+              <td>{{ m.accuracy }}%</td>
+              <td>{{ m.precision }}%</td>
+              <td>{{ m.recall }}%</td>
+              <td>{{ m.f1_score }}%</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    
+    <!-- Charts Row -->
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>Accuracy Comparison</strong></div>
+          <div class="card-body chart-container text-center">
+            <img src="data:image/png;base64,{{ spam_accuracy_chart }}" class="img-fluid" alt="Spam Accuracy Comparison">
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>All Metrics Comparison</strong></div>
+          <div class="card-body chart-container text-center">
+            <img src="data:image/png;base64,{{ spam_metrics_chart }}" class="img-fluid" alt="Spam All Metrics">
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Confusion Matrices -->
+    <h5 class="mt-4">Confusion Matrices</h5>
+    <div class="row">
+      {% for m in spam_models %}
+      <div class="col-md-4 mb-3">
+        <div class="card {% if m.is_best %}best-model{% endif %}">
+          <div class="card-header">
+            <strong>{{ m.algorithm }}</strong> ({{ m.feature_extraction }})
+            {% if m.is_best %}<span class="badge bg-success ms-2">Best</span>{% endif %}
+          </div>
+          <div class="card-body text-center">
+            <img src="data:image/png;base64,{{ m.cm_image }}" class="img-fluid" alt="Confusion Matrix">
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  
+  <!-- BoW vs TF-IDF Comparison Tab -->
+  <div class="tab-pane fade" id="comparison" role="tabpanel">
+    <h4>BoW vs TF-IDF Feature Extraction Comparison</h4>
+    
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>Average Performance Across All Models</strong></div>
+          <div class="card-body chart-container text-center">
+            <img src="data:image/png;base64,{{ bow_vs_tfidf_chart }}" class="img-fluid" alt="BoW vs TF-IDF Comparison">
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="row">
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header bg-info text-white"><strong>Bag of Words (BoW) Summary</strong></div>
+          <div class="card-body">
+            <table class="table table-sm">
+              <tr><td>Average Accuracy</td><td><strong>{{ bow_stats.accuracy }}%</strong></td></tr>
+              <tr><td>Average Precision</td><td><strong>{{ bow_stats.precision }}%</strong></td></tr>
+              <tr><td>Average Recall</td><td><strong>{{ bow_stats.recall }}%</strong></td></tr>
+              <tr><td>Average F1-Score</td><td><strong>{{ bow_stats.f1_score }}%</strong></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header bg-warning"><strong>TF-IDF Summary</strong></div>
+          <div class="card-body">
+            <table class="table table-sm">
+              <tr><td>Average Accuracy</td><td><strong>{{ tfidf_stats.accuracy }}%</strong></td></tr>
+              <tr><td>Average Precision</td><td><strong>{{ tfidf_stats.precision }}%</strong></td></tr>
+              <tr><td>Average Recall</td><td><strong>{{ tfidf_stats.recall }}%</strong></td></tr>
+              <tr><td>Average F1-Score</td><td><strong>{{ tfidf_stats.f1_score }}%</strong></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="row mt-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><strong>Winner: {{ winner }}</strong></div>
+          <div class="card-body">
+            <p>Based on average F1-Score across all models, <strong>{{ winner }}</strong> performs better for this dataset.</p>
+            <ul>
+              <li><strong>BoW (Bag of Words)</strong>: Simple word count, good for interpretability</li>
+              <li><strong>TF-IDF</strong>: Weighted by term importance, better for handling common words</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</div>
+</body>
+</html>
+'''
+
 
 @app.route('/', methods=['GET'])
 def index():
@@ -716,6 +1691,301 @@ def show_all():
 		return render_template_string(INDEX_HTML, table_html=table_html, error=None, rows_to_show=rows)
 	except Exception as e:
 		return render_template_string(INDEX_HTML, table_html=None, error=f"Error reading CSV: {e}")
+
+
+@app.route('/features', methods=['GET'])
+def features_view():
+    """Show raw feature extraction output (BoW or TF-IDF) without training."""
+    csv_path = request.args.get('csv_path', 'dataNew.csv')
+    text_col = request.args.get('text_col', 'comments')
+    method = request.args.get('method', 'bow')  # 'bow' or 'tfidf'
+    
+    try:
+        max_features = int(request.args.get('max_features', 50))
+    except:
+        max_features = 50
+    
+    try:
+        ngram = int(request.args.get('ngram', 1))
+    except:
+        ngram = 1
+    
+    ngram_range = (1, ngram)
+    
+    # Default response if no data yet
+    context = {
+        'csv_path': csv_path,
+        'text_col': text_col,
+        'method': method,
+        'max_features': max_features,
+        'ngram': ngram,
+        'method_name': 'Bag of Words (Count)' if method == 'bow' else 'TF-IDF',
+        'vocab': None,
+        'matrix_html': None,
+        'matrix_shape': (0, 0),
+        'sample_docs': [],
+        'error': None
+    }
+    
+    if not os.path.exists(csv_path):
+        context['error'] = f"File not found: {csv_path}"
+        return render_template_string(FEATURES_HTML, **context)
+    
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        context['error'] = f"Error reading CSV: {e}"
+        return render_template_string(FEATURES_HTML, **context)
+    
+    if text_col not in df.columns:
+        context['error'] = f"Column '{text_col}' not found. Available: {list(df.columns)}"
+        return render_template_string(FEATURES_HTML, **context)
+    
+    # Get texts and clean them
+    texts = df[text_col].astype(str).fillna('').tolist()
+    cleaned_texts = [clean_text(t) for t in texts]
+    
+    # Filter out empty texts
+    valid_data = [(i, orig, clean) for i, (orig, clean) in enumerate(zip(texts, cleaned_texts)) if clean.strip()]
+    
+    if not valid_data:
+        context['error'] = "No valid text data found after cleaning."
+        return render_template_string(FEATURES_HTML, **context)
+    
+    indices, originals, cleaned = zip(*valid_data)
+    cleaned = list(cleaned)
+    
+    # Apply feature extraction (NOT TRAINED - just transform)
+    if method == 'bow':
+        vectorizer = CountVectorizer(
+            ngram_range=ngram_range,
+            max_features=max_features
+        )
+    else:  # tfidf
+        vectorizer = TfidfVectorizer(
+            ngram_range=ngram_range,
+            max_features=max_features
+        )
+    
+    # Fit and transform the data
+    feature_matrix = vectorizer.fit_transform(cleaned)
+    
+    # Get vocabulary (sorted by index)
+    vocab = sorted(vectorizer.vocabulary_.items(), key=lambda x: x[1])
+    vocab_list = [(idx, term) for term, idx in vocab]
+    
+    # Convert sparse matrix to dense for display (limit rows for performance)
+    max_display_rows = min(20, feature_matrix.shape[0])
+    dense_matrix = feature_matrix[:max_display_rows].toarray()
+    
+    # Round TF-IDF values for readability
+    if method == 'tfidf':
+        dense_matrix = np.round(dense_matrix, 3)
+    
+    # Create DataFrame for display
+    feature_names = vectorizer.get_feature_names_out()
+    matrix_df = pd.DataFrame(
+        dense_matrix,
+        columns=feature_names,
+        index=[f"Doc {indices[i]}" for i in range(max_display_rows)]
+    )
+    
+    # Highlight non-zero values
+    def highlight_nonzero(val):
+        if val > 0:
+            return 'background-color: #d4edda'
+        return ''
+    
+    matrix_html = matrix_df.style.applymap(highlight_nonzero).to_html()
+    
+    # Sample documents
+    sample_docs = [
+        {'idx': indices[i], 'original': originals[i], 'cleaned': cleaned[i]}
+        for i in range(max_display_rows)
+    ]
+    
+    context.update({
+        'vocab': vocab_list,
+        'matrix_html': matrix_html,
+        'matrix_shape': feature_matrix.shape,
+        'sample_docs': sample_docs
+    })
+    
+    return render_template_string(FEATURES_HTML, **context)
+
+
+@app.route('/models', methods=['GET'])
+def models_view():
+    """Show comparison of all trained models."""
+    comparison = get_model_comparison()
+    
+    # Separate by task
+    sentiment_models = [m for m in comparison if m['task'] == 'Sentiment']
+    spam_models = [m for m in comparison if m['task'] == 'Spam']
+    
+    # Find best models
+    best_sentiment = max(sentiment_models, key=lambda x: x['cv_accuracy'])
+    best_spam = max(spam_models, key=lambda x: x['cv_accuracy'])
+    
+    # Mark best models
+    for m in sentiment_models:
+        m['is_best'] = (m['cv_accuracy'] == best_sentiment['cv_accuracy'])
+    for m in spam_models:
+        m['is_best'] = (m['cv_accuracy'] == best_spam['cv_accuracy'])
+    
+    return render_template_string(MODELS_HTML,
+        sentiment_models=sentiment_models,
+        spam_models=spam_models,
+        best_sentiment=best_sentiment,
+        best_spam=best_spam
+    )
+
+
+@app.route('/models/test', methods=['GET', 'POST'])
+def models_test():
+    """Test all models with custom text."""
+    test_text = ''
+    results = None
+    cleaned_text = ''
+    
+    if request.method == 'POST':
+        test_text = request.form.get('text', '')
+        
+        if test_text.strip():
+            cleaned_text = clean_text(test_text)
+            
+            results = {'sentiment': [], 'spam': []}
+            
+            algorithms = ['Naive Bayes', 'Decision Tree', 'SVM']
+            features = ['BoW', 'TF-IDF']
+            
+            for algo in algorithms:
+                for feat in features:
+                    # Sentiment
+                    sent_label, sent_conf = classify_with_model(test_text, 'sentiment', algo, feat)
+                    results['sentiment'].append({
+                        'algorithm': algo,
+                        'feature_extraction': feat,
+                        'label': sent_label,
+                        'confidence': sent_conf
+                    })
+                    
+                    # Spam
+                    spam_label, spam_conf = classify_with_model(test_text, 'spam', algo, feat)
+                    results['spam'].append({
+                        'algorithm': algo,
+                        'feature_extraction': feat,
+                        'label': spam_label,
+                        'confidence': spam_conf
+                    })
+    
+    return render_template_string(MODELS_TEST_HTML,
+        test_text=test_text,
+        results=results,
+        cleaned_text=cleaned_text
+    )
+
+
+@app.route('/models/evaluation', methods=['GET'])
+def models_evaluation():
+    """Show detailed model evaluation with metrics and visualizations."""
+    
+    # Prepare data for sentiment models
+    sentiment_models = []
+    for key, info in ALL_MODELS.items():
+        if info['task'] == 'sentiment':
+            cm_image = generate_confusion_matrix_heatmap(
+                np.array(info['confusion_matrix']),
+                info['labels'],
+                f"{info['algorithm']} ({info['feature_extraction']})"
+            )
+            sentiment_models.append({
+                'algorithm': info['algorithm'],
+                'feature_extraction': info['feature_extraction'],
+                'accuracy': info['accuracy'],
+                'precision': info['precision'],
+                'recall': info['recall'],
+                'f1_score': info['f1_score'],
+                'confusion_matrix': info['confusion_matrix'],
+                'labels': info['labels'],
+                'cm_image': cm_image,
+                'is_best': False
+            })
+    
+    # Prepare data for spam models
+    spam_models = []
+    for key, info in ALL_MODELS.items():
+        if info['task'] == 'spam':
+            cm_image = generate_confusion_matrix_heatmap(
+                np.array(info['confusion_matrix']),
+                info['labels'],
+                f"{info['algorithm']} ({info['feature_extraction']})"
+            )
+            spam_models.append({
+                'algorithm': info['algorithm'],
+                'feature_extraction': info['feature_extraction'],
+                'accuracy': info['accuracy'],
+                'precision': info['precision'],
+                'recall': info['recall'],
+                'f1_score': info['f1_score'],
+                'confusion_matrix': info['confusion_matrix'],
+                'labels': info['labels'],
+                'cm_image': cm_image,
+                'is_best': False
+            })
+    
+    # Mark best models
+    if sentiment_models:
+        best_sentiment = max(sentiment_models, key=lambda x: x['f1_score'])
+        for m in sentiment_models:
+            if m['f1_score'] == best_sentiment['f1_score']:
+                m['is_best'] = True
+    
+    if spam_models:
+        best_spam = max(spam_models, key=lambda x: x['f1_score'])
+        for m in spam_models:
+            if m['f1_score'] == best_spam['f1_score']:
+                m['is_best'] = True
+    
+    # Generate charts
+    sentiment_accuracy_chart = generate_accuracy_comparison_chart('sentiment')
+    spam_accuracy_chart = generate_accuracy_comparison_chart('spam')
+    sentiment_metrics_chart = generate_all_metrics_chart('sentiment')
+    spam_metrics_chart = generate_all_metrics_chart('spam')
+    bow_vs_tfidf_chart = generate_bow_vs_tfidf_chart()
+    
+    # Calculate BoW vs TF-IDF stats
+    bow_models = [v for v in ALL_MODELS.values() if v['feature_extraction'] == 'BoW']
+    tfidf_models = [v for v in ALL_MODELS.values() if v['feature_extraction'] == 'TF-IDF']
+    
+    bow_stats = {
+        'accuracy': round(np.mean([m['accuracy'] for m in bow_models]), 2),
+        'precision': round(np.mean([m['precision'] for m in bow_models]), 2),
+        'recall': round(np.mean([m['recall'] for m in bow_models]), 2),
+        'f1_score': round(np.mean([m['f1_score'] for m in bow_models]), 2)
+    }
+    
+    tfidf_stats = {
+        'accuracy': round(np.mean([m['accuracy'] for m in tfidf_models]), 2),
+        'precision': round(np.mean([m['precision'] for m in tfidf_models]), 2),
+        'recall': round(np.mean([m['recall'] for m in tfidf_models]), 2),
+        'f1_score': round(np.mean([m['f1_score'] for m in tfidf_models]), 2)
+    }
+    
+    winner = 'BoW' if bow_stats['f1_score'] >= tfidf_stats['f1_score'] else 'TF-IDF'
+    
+    return render_template_string(EVALUATION_HTML,
+        sentiment_models=sentiment_models,
+        spam_models=spam_models,
+        sentiment_accuracy_chart=sentiment_accuracy_chart,
+        spam_accuracy_chart=spam_accuracy_chart,
+        sentiment_metrics_chart=sentiment_metrics_chart,
+        spam_metrics_chart=spam_metrics_chart,
+        bow_vs_tfidf_chart=bow_vs_tfidf_chart,
+        bow_stats=bow_stats,
+        tfidf_stats=tfidf_stats,
+        winner=winner
+    )
 
 
 def classify_text_svm(text):
