@@ -6,6 +6,10 @@ import os
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import Pipeline
+import pickle
 
 # Ensure necessary NLTK data is available
 try:
@@ -37,6 +41,221 @@ def get_stopwords(lang='indonesian'):
 		return DEFAULT_IND_STOPWORDS
 
 STOPWORDS = get_stopwords('indonesian')
+
+# ===================== NAIVE BAYES CLASSIFIERS =====================
+
+# Indonesian Sentiment Lexicon (expanded)
+POSITIVE_WORDS = {
+    'bagus', 'baik', 'hebat', 'keren', 'mantap', 'suka', 'senang', 'gembira',
+    'indah', 'cantik', 'sempurna', 'luar biasa', 'amazing', 'good', 'great',
+    'best', 'terbaik', 'sukses', 'berhasil', 'menarik', 'recommended', 'recommend',
+    'setuju', 'sip', 'oke', 'ok', 'bangga', 'semangat', 'termotivasi', 'inspiratif',
+    'membanggakan', 'wow', 'wah', 'asik', 'asyik', 'jos', 'josss', 'top', 'mantul',
+    'mantab', 'cakep', 'ganteng', 'ramah', 'helpful', 'membantu', 'bermanfaat',
+    'berkualitas', 'professional', 'profesional', 'favorit', 'favourite', 'love',
+    'cinta', 'sayang', 'blessed', 'bersyukur', 'terima kasih', 'terimakasih', 'thanks',
+    'thank', 'appreciate', 'apresiasi', 'salut', 'respect', 'hormat', 'kagum',
+    'impian', 'dream', 'harapan', 'hope', 'optimis', 'positif', 'positive'
+}
+
+NEGATIVE_WORDS = {
+    'jelek', 'buruk', 'bodoh', 'tolol', 'goblok', 'benci', 'marah', 'kesal',
+    'kecewa', 'sedih', 'gagal', 'sampah', 'busuk', 'worst', 'bad', 'terrible',
+    'horrible', 'awful', 'disappointing', 'mengecewakan', 'menyesal', 'bohong',
+    'tipu', 'scam', 'penipuan', 'palsu', 'fake', 'hoax', 'bullshit', 'bs',
+    'anjing', 'anjir', 'bangsat', 'brengsek', 'kampret', 'kontol', 'memek',
+    'tai', 'setan', 'iblis', 'jahat', 'jahanam', 'sialan', 'mampus', 'mati',
+    'bego', 'idiot', 'stupid', 'dumb', 'lambat', 'lelet', 'malas', 'males',
+    'males', 'capek', 'cape', 'bosan', 'bosen', 'males', 'ogah', 'males',
+    'susah', 'ribet', 'repot', 'pusing', 'muak', 'jijik', 'kotor', 'jorok',
+    'kasar', 'toxic', 'racun', 'merusak', 'hancur', 'rusak', 'parah', 'payah'
+}
+
+# Spam indicators (common spam patterns in Indonesian social media)
+SPAM_INDICATORS = {
+    'klik', 'click', 'link', 'bio', 'promo', 'diskon', 'discount', 'gratis',
+    'free', 'hadiah', 'prize', 'menang', 'winner', 'claim', 'klaim', 'daftar',
+    'register', 'join', 'gabung', 'followers', 'follower', 'like', 'subscribe',
+    'subs', 'cek', 'check', 'order', 'pesan', 'beli', 'buy', 'jual', 'sell',
+    'murah', 'cheap', 'termurah', 'cheapest', 'terpercaya', 'trusted', 'reseller',
+    'dropship', 'cod', 'wa', 'whatsapp', 'dm', 'inbox', 'contact', 'hubungi',
+    'slot', 'gacor', 'jackpot', 'bonus', 'deposit', 'withdraw', 'betting', 'bet',
+    'casino', 'poker', 'togel', 'lottery', 'judi', 'gambling', 'maxwin', 'rtp',
+    'www', 'http', 'https', '.com', '.id', '.net', '.org', 'bit.ly', 'tinyurl',
+    'money', 'uang', 'rupiah', 'dollar', 'income', 'penghasilan', 'cuan', 'profit',
+    'investment', 'investasi', 'crypto', 'bitcoin', 'trading', 'forex'
+}
+
+def create_training_data():
+    """Create synthetic training data for sentiment and spam classifiers."""
+    # Sentiment training data (Indonesian)
+    sentiment_texts = []
+    sentiment_labels = []
+    
+    # Positive examples
+    positive_templates = [
+        "bagus banget", "keren abis", "mantap sekali", "suka banget",
+        "luar biasa", "terbaik", "recommended banget", "sangat membantu",
+        "semangat terus", "inspiratif sekali", "bangga sama", "love it",
+        "amazing content", "great job", "keep it up", "sukses selalu",
+        "terima kasih banyak", "sangat bermanfaat", "top markotop",
+        "gokil abis", "josss gandos", "mantul kali", "cakep banget",
+        "salut sama usahanya", "respect", "kagum", "wow keren",
+        "semoga sukses", "good luck", "all the best", "proud of you"
+    ]
+    for text in positive_templates:
+        sentiment_texts.append(text)
+        sentiment_labels.append('positive')
+    
+    # Add variations with positive words
+    for word in list(POSITIVE_WORDS)[:30]:
+        sentiment_texts.append(f"{word} sekali ini")
+        sentiment_labels.append('positive')
+    
+    # Negative examples
+    negative_templates = [
+        "jelek banget", "buruk sekali", "kecewa berat", "mengecewakan",
+        "gak bagus", "tidak recommended", "sampah", "worst ever",
+        "sangat buruk", "payah banget", "menyesal", "rugi",
+        "bohong semua", "tipu tipu", "penipuan", "fake news",
+        "bad service", "terrible experience", "sangat kecewa",
+        "buang waktu", "tidak berguna", "ribet banget", "susah amat",
+        "bosan", "males lihat", "jijik", "kotor banget", "parah sih"
+    ]
+    for text in negative_templates:
+        sentiment_texts.append(text)
+        sentiment_labels.append('negative')
+    
+    # Add variations with negative words
+    for word in list(NEGATIVE_WORDS)[:30]:
+        sentiment_texts.append(f"{word} banget sih")
+        sentiment_labels.append('negative')
+    
+    # Spam training data
+    spam_texts = []
+    spam_labels = []
+    
+    # Spam examples
+    spam_templates = [
+        "klik link di bio", "cek profil untuk info", "dm untuk order",
+        "promo diskon 50%", "gratis ongkir", "hadiah menanti",
+        "daftar sekarang dapat bonus", "follow back ya", "like dan subscribe",
+        "slot gacor hari ini", "maxwin jackpot", "bonus deposit 100%",
+        "jual followers murah", "wa 08xxx untuk order", "hubungi admin",
+        "reseller welcome", "dropship bisa", "cod seluruh indonesia",
+        "investasi profit tinggi", "cuan setiap hari", "penghasilan jutaan",
+        "www.linkspam.com", "bit.ly/promo", "kunjungi website kami",
+        "trading forex profit", "crypto to the moon", "bitcoin gratis"
+    ]
+    for text in spam_templates:
+        spam_texts.append(text)
+        spam_labels.append('spam')
+    
+    # Not spam examples (normal comments)
+    not_spam_templates = [
+        "bagus videonya", "keren kontennya", "mantap", "semangat",
+        "informatif sekali", "terima kasih infonya", "bermanfaat",
+        "setuju sama pendapatnya", "nice content", "good job",
+        "kapan upload lagi", "ditunggu video selanjutnya", "the best",
+        "suka banget sama channel ini", "selalu menginspirasi",
+        "kecewa sih sama hasilnya", "kurang bagus menurutku",
+        "agak membingungkan", "coba dijelaskan lebih detail",
+        "pertanyaan dong", "mau tanya", "gimana caranya",
+        "siapa nama lagunya", "lokasi dimana ini", "kapan eventnya",
+        "relate banget", "sama kayak aku", "bener banget ini"
+    ]
+    for text in not_spam_templates:
+        spam_texts.append(text)
+        spam_labels.append('not_spam')
+    
+    return sentiment_texts, sentiment_labels, spam_texts, spam_labels
+
+def train_classifiers():
+    """Train Naive Bayes classifiers for sentiment and spam detection."""
+    sentiment_texts, sentiment_labels, spam_texts, spam_labels = create_training_data()
+    
+    # Sentiment classifier
+    sentiment_pipeline = Pipeline([
+        ('vectorizer', CountVectorizer(ngram_range=(1, 2), max_features=5000)),
+        ('classifier', MultinomialNB(alpha=0.1))
+    ])
+    sentiment_pipeline.fit(sentiment_texts, sentiment_labels)
+    
+    # Spam classifier
+    spam_pipeline = Pipeline([
+        ('vectorizer', CountVectorizer(ngram_range=(1, 2), max_features=5000)),
+        ('classifier', MultinomialNB(alpha=0.1))
+    ])
+    spam_pipeline.fit(spam_texts, spam_labels)
+    
+    return sentiment_pipeline, spam_pipeline
+
+# Initialize classifiers
+print("Training Naive Bayes classifiers...")
+SENTIMENT_CLASSIFIER, SPAM_CLASSIFIER = train_classifiers()
+print("Classifiers ready!")
+
+def classify_sentiment(text: str) -> tuple:
+    """Classify text sentiment using Naive Bayes.
+    Returns (label, confidence).
+    """
+    if not text or not text.strip():
+        return ('neutral', 0.0)
+    
+    text_clean = clean_text(text)
+    if not text_clean:
+        return ('neutral', 0.0)
+    
+    # Get prediction and probability
+    prediction = SENTIMENT_CLASSIFIER.predict([text_clean])[0]
+    proba = SENTIMENT_CLASSIFIER.predict_proba([text_clean])[0]
+    confidence = max(proba)
+    
+    # If confidence is low, also check lexicon
+    tokens = set(text_clean.lower().split())
+    pos_count = len(tokens & POSITIVE_WORDS)
+    neg_count = len(tokens & NEGATIVE_WORDS)
+    
+    # Hybrid approach: combine model prediction with lexicon
+    if confidence < 0.6:
+        if pos_count > neg_count:
+            return ('positive', 0.5 + (pos_count / (pos_count + neg_count + 1)) * 0.3)
+        elif neg_count > pos_count:
+            return ('negative', 0.5 + (neg_count / (pos_count + neg_count + 1)) * 0.3)
+        else:
+            return ('neutral', 0.5)
+    
+    return (prediction, round(confidence, 2))
+
+def classify_spam(text: str) -> tuple:
+    """Classify if text is spam using Naive Bayes.
+    Returns (label, confidence).
+    """
+    if not text or not text.strip():
+        return ('not_spam', 0.0)
+    
+    text_clean = clean_text(text)
+    if not text_clean:
+        return ('not_spam', 0.0)
+    
+    # Get prediction and probability
+    prediction = SPAM_CLASSIFIER.predict([text_clean])[0]
+    proba = SPAM_CLASSIFIER.predict_proba([text_clean])[0]
+    confidence = max(proba)
+    
+    # Also check spam indicators
+    text_lower = text.lower()
+    spam_score = sum(1 for indicator in SPAM_INDICATORS if indicator in text_lower)
+    
+    # Hybrid approach
+    if spam_score >= 3:
+        return ('spam', min(0.9, 0.6 + spam_score * 0.05))
+    elif confidence < 0.6 and spam_score >= 1:
+        return ('spam', 0.55)
+    
+    return (prediction, round(confidence, 2))
+
+# ===================== END CLASSIFIERS =====================
 
 EMOJI_PATTERN = re.compile("["
 													 "\U0001F600-\U0001F64F"  # emoticons
@@ -158,11 +377,61 @@ RESULT_HTML = '''
 		<meta name="viewport" content="width=device-width, initial-scale=1">
 		<title>Preprocessing Result</title>
 		<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+		<style>
+			.badge-positive { background-color: #198754; }
+			.badge-negative { background-color: #dc3545; }
+			.badge-neutral { background-color: #6c757d; }
+			.badge-spam { background-color: #fd7e14; }
+			.badge-not_spam { background-color: #20c997; }
+		</style>
 	</head>
 	<body class="bg-light">
 		<div class="container py-4">
-			<h1 class="mb-3">Preprocessing Result</h1>
+			<h1 class="mb-3">Preprocessing & Classification Result</h1>
 			<a href="/" class="btn btn-secondary mb-3">&larr; Back</a>
+
+			{% if stats %}
+			<div class="row mb-4">
+				<div class="col-md-6">
+					<div class="card">
+						<div class="card-header"><strong>Sentiment Analysis (Naive Bayes)</strong></div>
+						<div class="card-body">
+							<div class="d-flex justify-content-around text-center">
+								<div>
+									<h3 class="text-success">{{ stats.positive }}</h3>
+									<small>Positive</small>
+								</div>
+								<div>
+									<h3 class="text-danger">{{ stats.negative }}</h3>
+									<small>Negative</small>
+								</div>
+								<div>
+									<h3 class="text-secondary">{{ stats.neutral }}</h3>
+									<small>Neutral</small>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+				<div class="col-md-6">
+					<div class="card">
+						<div class="card-header"><strong>Spam Detection (Naive Bayes)</strong></div>
+						<div class="card-body">
+							<div class="d-flex justify-content-around text-center">
+								<div>
+									<h3 class="text-warning">{{ stats.spam }}</h3>
+									<small>Spam</small>
+								</div>
+								<div>
+									<h3 class="text-info">{{ stats.not_spam }}</h3>
+									<small>Not Spam</small>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+			{% endif %}
 
 			<h5>Processed (first {{ n_rows }} rows)</h5>
 			<div class="d-flex justify-content-between align-items-center mb-2">
@@ -191,6 +460,8 @@ RESULT_HTML = '''
 				<li>Cleaning steps: remove URLs, emojis, mentions, punctuation, digits.</li>
 				<li>Tokenization: NLTK word_tokenize (fallback to split on failure).</li>
 				<li>Stopwords: NLTK Indonesian stopwords if available, otherwise fallback list.</li>
+				<li><strong>Sentiment:</strong> Naive Bayes classifier with Indonesian lexicon (positive/negative/neutral).</li>
+				<li><strong>Spam Detection:</strong> Naive Bayes classifier trained on common spam patterns.</li>
 			</ul>
 		</div>
 	</body>
@@ -290,11 +561,36 @@ def preprocess():
 	cleaned = processed.map(lambda x: x[0])
 	tokens = processed.map(lambda x: x[1])
 
+	# Apply classification
+	def classify_text(text):
+		sentiment_result = classify_sentiment(text)
+		spam_result = classify_spam(text)
+		return (sentiment_result, spam_result)
+	
+	classifications = texts.map(classify_text)
+	sentiment_labels = classifications.map(lambda x: x[0][0])
+	sentiment_conf = classifications.map(lambda x: x[0][1])
+	spam_labels = classifications.map(lambda x: x[1][0])
+	spam_conf = classifications.map(lambda x: x[1][1])
+
 	result_df = pd.DataFrame({
 		'original': texts,
 		'cleaned_segments': cleaned,
-		'tokens_per_segment': tokens
+		'tokens_per_segment': tokens,
+		'sentiment': sentiment_labels,
+		'sentiment_conf': sentiment_conf,
+		'spam': spam_labels,
+		'spam_conf': spam_conf
 	})
+	
+	# Calculate statistics for all data
+	stats = {
+		'positive': int((sentiment_labels == 'positive').sum()),
+		'negative': int((sentiment_labels == 'negative').sum()),
+		'neutral': int((sentiment_labels == 'neutral').sum()),
+		'spam': int((spam_labels == 'spam').sum()),
+		'not_spam': int((spam_labels == 'not_spam').sum())
+	}
 
 	total = int(result_df.shape[0])
 	total_pages = max(1, (total + page_size - 1) // page_size)
@@ -306,12 +602,26 @@ def preprocess():
 	end = start + page_size
 	slice_df = result_df.iloc[start:end].copy()
 
+	# Format sentiment and spam columns with badges
+	def format_sentiment(row):
+		label = row['sentiment']
+		conf = row['sentiment_conf']
+		return f'<span class="badge badge-{label}">{label}</span> <small>({conf:.0%})</small>'
+	
+	def format_spam(row):
+		label = row['spam']
+		conf = row['spam_conf']
+		return f'<span class="badge badge-{label}">{label.replace("_", " ")}</span> <small>({conf:.0%})</small>'
+	
+	slice_df['sentiment'] = slice_df.apply(format_sentiment, axis=1)
+	slice_df['spam'] = slice_df.apply(format_spam, axis=1)
+	slice_df = slice_df.drop(columns=['sentiment_conf', 'spam_conf'])
+
 	# If text_col looks like URL, convert original column to links
 	if 'url' in text_col.lower():
 		slice_df['original'] = slice_df['original'].fillna('').apply(lambda u: f'<a href="{u}" target="_blank" rel="noopener noreferrer">{u}</a>' if str(u).strip() else '')
-		result_table = slice_df.to_html(classes='table table-sm table-striped', index=False, escape=False)
-	else:
-		result_table = slice_df.to_html(classes='table table-sm table-striped', index=False, escape=True)
+	
+	result_table = slice_df.to_html(classes='table table-sm table-striped', index=False, escape=False)
 
 	# render result with pagination context
 	return render_template_string(RESULT_HTML,
@@ -321,7 +631,8 @@ def preprocess():
 		total_pages=total_pages,
 		csv_path=csv_path,
 		text_col=text_col,
-		page_size=page_size)
+		page_size=page_size,
+		stats=stats)
 
 
 if __name__ == '__main__':
