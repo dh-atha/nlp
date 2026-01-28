@@ -281,10 +281,12 @@ def train_svm_classifiers():
         ('tfidf', TfidfVectorizer(max_features=5000)),
         ('svm', LinearSVC())
     ])
+    
+    sentiment_pipeline.fit(sentiment_texts, sentiment_labels)
 
     sentiment_svm = CalibratedClassifierCV(
         estimator=sentiment_pipeline,
-        cv=5
+        cv='prefit'
     )
     sentiment_svm.fit(sentiment_texts, sentiment_labels)
 
@@ -293,10 +295,12 @@ def train_svm_classifiers():
         ('tfidf', TfidfVectorizer(max_features=5000)),
         ('svm', LinearSVC())
     ])
+    
+    spam_pipeline.fit(spam_texts, spam_labels)
 
     spam_svm = CalibratedClassifierCV(
         estimator=spam_pipeline,
-        cv=5
+        cv='prefit'
     )
     spam_svm.fit(spam_texts, spam_labels)
 
@@ -407,7 +411,9 @@ def train_all_models():
                     clf2 = LinearSVC(random_state=42, max_iter=2000)
                     pipeline2 = Pipeline([('vectorizer', vec2), ('classifier', clf2)])
                     
-                    calibrated = CalibratedClassifierCV(estimator=pipeline2, cv=5)
+                    pipeline2.fit(texts, labels)
+                    
+                    calibrated = CalibratedClassifierCV(estimator=pipeline2, cv='prefit')
                     calibrated.fit(texts, labels)
                     final_model = calibrated
                 else:
