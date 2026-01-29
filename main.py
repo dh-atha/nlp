@@ -443,6 +443,66 @@ print("\nTraining ALL model combinations (3 algorithms Ã— 2 feature extractors Ã
 ALL_MODELS = train_all_models()
 print(f"All {len(ALL_MODELS)} models ready!\n")
 
+def generate_pie_chart(data_dict, title, colors=None):
+    """Generate a pie chart as base64 image.
+    
+    Args:
+        data_dict: dict with labels as keys and counts as values
+        title: Chart title
+        colors: Optional dict mapping labels to colors
+    """
+    labels = list(data_dict.keys())
+    sizes = list(data_dict.values())
+    
+    # Filter out zero values
+    non_zero = [(l, s) for l, s in zip(labels, sizes) if s > 0]
+    if not non_zero:
+        return None
+    labels, sizes = zip(*non_zero)
+    
+    # Default colors
+    default_colors = {
+        'positive': '#198754',
+        'negative': '#dc3545',
+        'neutral': '#6c757d',
+        'spam': '#fd7e14',
+        'not_spam': '#20c997'
+    }
+    if colors is None:
+        colors = default_colors
+    
+    chart_colors = [colors.get(l, '#6c757d') for l in labels]
+    
+    fig, ax = plt.subplots(figsize=(5, 4))
+    wedges, texts, autotexts = ax.pie(
+        sizes, 
+        labels=labels, 
+        colors=chart_colors,
+        autopct=lambda pct: f'{pct:.1f}%\n({int(round(pct/100.*sum(sizes)))})',
+        startangle=90,
+        explode=[0.02] * len(labels)
+    )
+    
+    # Style the text
+    for autotext in autotexts:
+        autotext.set_fontsize(9)
+        autotext.set_fontweight('bold')
+    for text in texts:
+        text.set_fontsize(10)
+    
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.axis('equal')
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return img_base64
+
 def generate_confusion_matrix_heatmap(conf_matrix, labels, title):
     """Generate confusion matrix heatmap as base64 image."""
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -1000,6 +1060,8 @@ COMMENT_HTML = '''
     .badge-neutral { background:#6c757d }
     .badge-spam { background:#fd7e14 }
     .badge-not_spam { background:#20c997 }
+    .chart-container { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; margin-bottom: 20px; }
+    .chart-card { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
   </style>
 </head>
 <body class="bg-light">
@@ -1013,6 +1075,20 @@ COMMENT_HTML = '''
    class="btn btn-outline-primary mb-3 ms-2">
    SVM View
 </a>
+
+<!-- Pie Charts -->
+<div class="chart-container">
+  {% if sentiment_pie %}
+  <div class="chart-card">
+    <img src="data:image/png;base64,{{ sentiment_pie }}" alt="Sentiment Distribution">
+  </div>
+  {% endif %}
+  {% if spam_pie %}
+  <div class="chart-card">
+    <img src="data:image/png;base64,{{ spam_pie }}" alt="Spam Distribution">
+  </div>
+  {% endif %}
+</div>
 
 <div class="d-flex justify-content-between mb-2">
   <div>Page {{ page }} / {{ total_pages }}</div>
@@ -1053,6 +1129,8 @@ SVM_HTML = '''
     .badge-neutral { background:#6c757d }
     .badge-spam { background:#fd7e14 }
     .badge-not_spam { background:#20c997 }
+    .chart-container { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; margin-bottom: 20px; }
+    .chart-card { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
   </style>
 </head>
 <body class="bg-light">
@@ -1066,6 +1144,20 @@ SVM_HTML = '''
    class="btn btn-outline-primary mb-3 ms-2">
    Naive Bayes View
 </a>
+
+<!-- Pie Charts -->
+<div class="chart-container">
+  {% if sentiment_pie %}
+  <div class="chart-card">
+    <img src="data:image/png;base64,{{ sentiment_pie }}" alt="Sentiment Distribution">
+  </div>
+  {% endif %}
+  {% if spam_pie %}
+  <div class="chart-card">
+    <img src="data:image/png;base64,{{ spam_pie }}" alt="Spam Distribution">
+  </div>
+  {% endif %}
+</div>
 
 <div class="d-flex justify-content-between mb-2">
   <div>Page {{ page }} / {{ total_pages }}</div>
@@ -2580,6 +2672,13 @@ def comments_view():
         lambda x: pd.Series(classify_spam(x))
     )
 
+    # Generate pie charts for ALL comments (before pagination)
+    sentiment_counts = exploded['sentiment'].value_counts().to_dict()
+    spam_counts = exploded['spam'].value_counts().to_dict()
+    
+    sentiment_pie = generate_pie_chart(sentiment_counts, 'Sentiment Distribution (Naive Bayes)')
+    spam_pie = generate_pie_chart(spam_counts, 'Spam Detection (Naive Bayes)')
+
     # Pagination
     total = len(exploded)
     total_pages = max(1, (total + page_size - 1) // page_size)
@@ -2614,7 +2713,9 @@ def comments_view():
         total_pages=total_pages,
         csv_path=csv_path,
         text_col=text_col,
-        page_size=page_size
+        page_size=page_size,
+        sentiment_pie=sentiment_pie,
+        spam_pie=spam_pie
     )
 
 @app.route('/svm', methods=['GET'])
@@ -2648,6 +2749,13 @@ def svm_view():
         lambda x: pd.Series(classify_spam_svm(x))
     )
 
+    # Generate pie charts for ALL comments (before pagination)
+    sentiment_counts = exploded['sentiment'].value_counts().to_dict()
+    spam_counts = exploded['spam'].value_counts().to_dict()
+    
+    sentiment_pie = generate_pie_chart(sentiment_counts, 'Sentiment Distribution (SVM)')
+    spam_pie = generate_pie_chart(spam_counts, 'Spam Detection (SVM)')
+
     total = len(exploded)
     total_pages = max(1, (total + page_size - 1) // page_size)
 
@@ -2680,7 +2788,9 @@ def svm_view():
         total_pages=total_pages,
         csv_path=csv_path,
         text_col=text_col,
-        page_size=page_size
+        page_size=page_size,
+        sentiment_pie=sentiment_pie,
+        spam_pie=spam_pie
     )
 
 
